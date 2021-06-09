@@ -6,10 +6,10 @@ with open("README.md", "r") as fh:
 
 setuptools.setup(
     name='phone_modem',
-    version='0.0.2',
+    version='0.1.0',
     author='Robert Hillis',
     author_email='tkdrob4390@yahoo.com',
-    description='A modem implementation designed for Home Assistant for receiving caller id and call rejection.',
+    description='An asynchronous modem implementation designed for Home Assistant for receiving caller id and call rejection.',
     long_description=long_description,
     long_description_content_type="text/markdown",
     url='https://github.com/tkdrob/phone_modem',

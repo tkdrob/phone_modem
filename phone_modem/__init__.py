@@ -1,32 +1,27 @@
-"""
-A modem implementation designed for Home Assistant that supports caller ID and
-call rejection.
+"""A modem implementation designed for Home Assistant.
 
+Supports caller ID and call rejection.
 For more details about this platform, please refer to the documentation at
 https://github.com/tkdrob/phone_modem
-
-Original work credited to tgvitz@gmail.com and havocsec-os@pm.me:
+Original work credited to tgvitz@gmail.com:
 https://github.com/vroomfonde1/basicmodem
-https://github.com/havocsec/cx93001
 """
-import logging
-import os
-import serial
-import time
-import wave
-from . import exceptions
+import asyncio
 from datetime import datetime
-from pydub import AudioSegment
+import logging
 
+import aioserial
+
+from . import exceptions
 
 _LOGGER = logging.getLogger(__name__)
 DEFAULT_PORT = "/dev/ttyACM0"
 DEFAULT_CMD_CALLERID = "AT+VCID=1"
-READ_RING_TIMOUT = 10
+READ_RING_TIMEOUT = 10
 READ_IDLE_TIMEOUT = None
 
 
-class PhoneModem(object):
+class PhoneModem:
     """Implementation of modem."""
 
     STATE_IDLE = "idle"
@@ -36,8 +31,6 @@ class PhoneModem(object):
 
     def __init__(self, port=DEFAULT_PORT, incomingcallback=None):
         """Initialize internal variables."""
-        import threading
-
         self.port = port
         self.incomingcallnotificationfunc = (
             incomingcallback or self._placeholdercallback
@@ -51,31 +44,40 @@ class PhoneModem(object):
         self.cid_number = ""
         self.ser = None
 
-        _LOGGER.debug("Opening port %s", self.port)
+    async def test(self, port=DEFAULT_PORT):
+        """Test the modem."""
         try:
-            self.ser = serial.Serial(port=self.port)
-        except (serial.SerialException) as ex:
+            self.ser = aioserial.AioSerial(port=port)
+        except (aioserial.SerialException) as ex:
             self.ser = None
             raise exceptions.SerialError from ex
 
-        threading.Thread(target=self._modem_sm, daemon=True).start()
+    async def initialize(self, port=DEFAULT_PORT):
+        """Initialize modem."""
+        self.port = port
+        await self.test(port)
+
+        _LOGGER.debug("Opening port %s", self.port)
+
+        asyncio.create_task(self._modem_sm())
+
         try:
-            self.sendcmd("AT")
-            if self.get_response() == "":
+            await self._sendcmd("AT")
+            if self._get_response() == "":
                 _LOGGER.error("No response from modem on port %s", self.port)
                 self.ser.close()
                 self.ser = None
                 return
-            self.sendcmd(self.cmd_callerid)
-            if self.get_response() in ["", "ERROR"]:
-                _LOGGER.error("Error enabling caller id on modem.")
+            await self._sendcmd(self.cmd_callerid)
+            if self._get_response() in ["", "ERROR"]:
+                _LOGGER.error("Error enabling caller id on modem")
                 self.ser.close()
                 self.ser = None
                 return
-        except serial.SerialException:
+        except aioserial.SerialException:
             _LOGGER.error("Unable to communicate with modem on port %s", self.port)
             self.ser = None
-        self.set_state(self.STATE_IDLE)
+        await self._set_state(self.STATE_IDLE)
 
     def registercallback(self, incomingcallback=None):
         """Register/unregister callback."""
@@ -83,39 +85,36 @@ class PhoneModem(object):
             incomingcallback or self._placeholdercallback
         )
 
-    def read(self, timeout=1.0):
-        """read from modem port, return null string on timeout."""
+    async def _read(self, timeout=1.0):
+        """Read from modem port, return null string on timeout."""
         self.ser.timeout = timeout
         if self.ser is None:
             return ""
-        return self.ser.readline()
+        return await self.ser.readline_async()
 
-    def write(self, cmd="AT"):
-        """write string to modem, returns number of bytes written."""
+    async def _write(self, cmd="AT"):
+        """Write string to modem, returns number of bytes written."""
         self.cmd_response = ""
         self.cmd_responselines = []
         if self.ser is None:
             return 0
         cmd += "\r\n"
-        return self.ser.write(cmd.encode())
+        return await self.ser.write_async(cmd.encode())
 
-    def sendcmd(self, cmd="AT", timeout=1.0):
-        """send command, wait for response. returns response from modem."""
-        import time
-
-        if self.write(cmd):
-            while self.get_response() == "" and timeout > 0:
-                time.sleep(0.1)
+    async def _sendcmd(self, cmd="AT", timeout=1.0):
+        """Send command, wait for response. returns response from modem."""
+        if await self._write(cmd):
+            while self._get_response() == "" and timeout > 0:
+                await asyncio.sleep(0.1)
                 timeout -= 0.1
-        return self.get_lines()
+        return self._get_lines()
 
     # pylint: disable = no-self-use
     def _placeholdercallback(self, newstate):
-        """ Does nothing."""
+        """Do nothing."""
         _LOGGER.debug("placeholder callback: %s", newstate)
-        return
 
-    def set_state(self, state):
+    async def _set_state(self, state):
         """Set the state."""
         self._state = state
         return
@@ -137,39 +136,37 @@ class PhoneModem(object):
 
     @property
     def get_cidtime(self):
-        """Returns time of last call."""
+        """Return time of last call."""
         return self.cid_time
 
-    def get_response(self):
+    def _get_response(self):
         """Return completion code from modem (OK, ERROR, null string)."""
         return self.cmd_response
 
-    def get_lines(self):
-        """Returns response from last modem command, including blank lines."""
+    def _get_lines(self):
+        """Return response from last modem command, including blank lines."""
         return self.cmd_responselines
 
-    def close(self):
-        """close modem port, exit worker thread."""
+    async def close(self):
+        """Close modem port, exit worker thread."""
         if self.ser:
             self.ser.close()
             self.ser = None
         return
 
-    def _modem_sm(self):
+    async def _modem_sm(self, timeout=READ_IDLE_TIMEOUT):
         """Handle modem response state machine."""
-        import datetime
-
-        read_timeout = READ_IDLE_TIMEOUT
+        read_timeout = timeout
         while self.ser:
             try:
-                resp = self.read(read_timeout)
-            except (serial.SerialException, SystemExit, TypeError):
+                resp = await self._read(read_timeout)
+            except (aioserial.SerialException, SystemExit, TypeError):
                 _LOGGER.debug("Unable to read from port %s", self.port)
                 break
 
             if self.state != self.STATE_IDLE and len(resp) == 0:
                 read_timeout = READ_IDLE_TIMEOUT
-                self.set_state(self.STATE_IDLE)
+                await self._set_state(self.STATE_IDLE)
                 self.incomingcallnotificationfunc(self.state)
                 continue
 
@@ -187,22 +184,22 @@ class PhoneModem(object):
                 if self.state == self.STATE_IDLE:
                     self.cid_name = ""
                     self.cid_number = ""
-                    self.cid_time = datetime.datetime.now()
+                    self.cid_time = datetime.now()
 
-                self.set_state(self.STATE_RING)
+                await self._set_state(self.STATE_RING)
                 self.incomingcallnotificationfunc(self.state)
-                read_timeout = READ_RING_TIMOUT
+                read_timeout = READ_RING_TIMEOUT
                 continue
 
             if len(resp) <= 4 or resp.find("=") == -1:
                 continue
 
-            read_timeout = READ_RING_TIMOUT
+            read_timeout = READ_RING_TIMEOUT
             cid_field, cid_data = resp.split("=")
             cid_field = cid_field.strip()
             cid_data = cid_data.strip()
             if cid_field in ["DATE"]:
-                self.cid_time = datetime.datetime.now()
+                self.cid_time = datetime.now()
                 continue
 
             if cid_field in ["NMBR"]:
@@ -211,7 +208,7 @@ class PhoneModem(object):
 
             if cid_field in ["NAME"]:
                 self.cid_name = cid_data
-                self.set_state(self.STATE_CALLERID)
+                await self._set_state(self.STATE_CALLERID)
                 self.incomingcallnotificationfunc(self.state)
                 _LOGGER.debug(
                     "CID: %s %s %s",
@@ -220,139 +217,34 @@ class PhoneModem(object):
                     self.cid_number,
                 )
                 try:
-                    self.write(self.cmd_callerid)
-                except serial.SerialException:
+                    await self._write(self.cmd_callerid)
+                except aioserial.SerialException:
                     _LOGGER.error("Unable to write to port %s", self.port)
                     break
 
             continue
 
-        self.set_state(self.STATE_FAILED)
+        await self._set_state(self.STATE_FAILED)
         _LOGGER.debug("Exiting modem state machine")
-        return
 
-    def accept_call(self, port=DEFAULT_PORT):
-        """Accepts an incoming call"""
-        self.ser = serial.Serial(port)
-        self.sendcmd("ATA")
+    async def accept_call(self, port=DEFAULT_PORT):
+        """Accept an incoming call."""
+        if self.port != port:
+            self.initialize(port)
+        await self._sendcmd("ATA")
 
-    def reject_call(self, port=DEFAULT_PORT):
-        """Rejects an incoming call. Answers the call and immediately hangs up in order to correctly terminate the incoming call."""
-        self.ser = serial.Serial(port)
-        self.accept_call(port)
-        self.hangup_call(port)
+    async def reject_call(self, port=DEFAULT_PORT):
+        """Reject an incoming call.
 
-    def hangup_call(self, port=DEFAULT_PORT):
-        """Terminates the currently ongoing call"""
-        self.sendcmd("AT+FCLASS=8")
-        self.sendcmd("ATH")
-
-    def tts_say(self, phrase, lang="english"):
-        """Transmits a TTS phrase over an ongoing call
-
-        Uses espeak and ffmpeg to generate a wav file of the phrase. Then, it's transmitted over the ongoing call.
+        Answers the call and immediately hangs up to correctly
+        terminate the call.
         """
-        os.system(
-            "espeak -w temp.wav -v"
-            + lang
-            + ' "'
-            + phrase
-            + '" ; ffmpeg -i temp.wav -ar 8000 -acodec pcm_u8 '
-            " -ac 1 phrase.wav"
-        )
-        os.remove("temp.wav")
-        self.play_audio_file("phrase.wav")
-        os.remove("../phrase.wav")
+        await self.accept_call(port)
+        await self.hangup_call(port)
 
-    def play_tones(self, sequence):
-        """Plays a sequence of DTMF tones
-
-        Plays a sequence of DTMF tones over an ongoing call.
-        """
-
-        self.__at("AT+VTS=" + ",".join(sequence))
-        time.sleep(len(sequence))
-
-    def play_audio_obj(self, wavobj, timeout=0):
-        """Transmits a wave audio object over an ongoing call
-
-        Transmits a wave audio object over an ongoing call. Enables voice transmit mode and the audio is
-        played until it's finished if the timeout is 0 or until the timeout is reached.
-        """
-
-        if timeout == 0:
-            timeout = wavobj.getnframes() / wavobj.getframerate()
-        self.__at("AT+VTX")
-        # print(timeout)
-        chunksize = 1024
-        start_time = time.time()
-        data = wavobj.readframes(chunksize)
-        while data != "":
-            self.__con.write(data)
-            data = wavobj.readframes(chunksize)
-            time.sleep(0.06)
-            if time.time() - start_time >= timeout:
-                break
-
-    def play_audio_file(self, wavfile, timeout=0):
-        """Transmits a wave 8-bit PCM mono @ 8000Hz audio file over an ongoing call
-
-        Transmits a wave 8-bit PCM mono @ 8000Hz audio file over an ongoing call. Enables voice transmit mode
-        and the audio is played until it finished if the timeout is 0 or until the timeout is reached.
-        """
-
-        wavobj = wave.open(wavfile, "rb")
-        self.play_audio_obj(wavobj, timeout=timeout)
-        wavobj.close()
-
-    def dial(self, number):
-        """Initiate a call with the desired number
-
-        Sets the modem to voice mode, sets the sampling mode to 8-bit PCM mono @ 8000 Hz, enables transmitting
-        operating mode, silence detection over a period of 5 seconds and dials to the desired number.
-        """
-
-        self.__at("AT+FCLASS=8")
-        self.__at("AT+VSM=1,8000,0,0")
-        self.__at("AT+VLS=1")
-        self.__at("AT+VSD=128,50")
-        self.__at("ATD" + number)
-
-    def record_call(self, date=datetime.now(), number="unknown", timeout=7200):
-        """Records an ongoing call until it's finished or the timeout is reached
-
-        Sets the modem to voice mode, sets the sampling mode to 8-bit PCM mono @ 8000 Hz, enables transmitting
-        operating mode, silence detection over a period of 5 seconds and voice reception mode. Then, a mp3 file
-        is written until the end of the call or until the timeout is reached.
-        """
-
-        self.__at("AT+FCLASS=8")
-        self.__at("AT+VSM=1,8000,0,0")
-        self.__at("AT+VLS=1")
-        self.__at("AT+VSD=128,50")
-        self.__at("AT+VRX", "CONNECT")
-
-        chunksize = 1024
-        frames = []
-        start = time.time()
-        while True:
-            chunk = self.__con.read(chunksize)
-            if self.__detect_end(chunk):
-                break
-            if time.time() - start >= timeout:
-                # print('Timeout reached')
-                break
-            frames.append(chunk)
-        self.hang_up()
-        # Merge frames and save temporarily as .wav
-        wav_path = date.strftime("%d-%m-%Y_%H:%M:%S_") + number + ".wav"
-        wav_file = wave.open(wav_path, "wb")
-        wav_file.setnchannels(1)
-        wav_file.setsampwidth(1)
-        wav_file.setframerate(8000)
-        wav_file.writeframes(b"".join(frames))
-        wav_file.close()
-        # Convert from .wav to .mp3 in order to save space
-        segment = AudioSegment.from_wav(wav_path)
-        segment.export(wav_path[:-3] + "mp3", format="mp3")
-        os.remove(wav_path)
+    async def hangup_call(self, port=DEFAULT_PORT):
+        """Terminate the currently ongoing call."""
+        if self.port != port:
+            await self.initialize(port)
+        await self._sendcmd("AT+FCLASS=8")
+        await self._sendcmd("ATH")
