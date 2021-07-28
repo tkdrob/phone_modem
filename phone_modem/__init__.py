@@ -21,7 +21,7 @@ READ_RING_TIMEOUT = 10
 READ_IDLE_TIMEOUT = None
 
 
-class PhoneModem:
+class PhoneModem:  # pylint: disable=too-many-instance-attributes
     """Implementation of modem."""
 
     STATE_IDLE = "idle"
@@ -35,7 +35,7 @@ class PhoneModem:
         self.incomingcallnotificationfunc = (
             incomingcallback or self._placeholdercallback
         )
-        self._state = self.STATE_FAILED
+        self.state = self.STATE_FAILED
         self.cmd_callerid = DEFAULT_CMD_CALLERID
         self.cmd_response = ""
         self.cmd_responselines = []
@@ -44,7 +44,7 @@ class PhoneModem:
         self.cid_number = ""
         self.ser = None
 
-    async def test(self, port=DEFAULT_PORT):
+    async def test(self, port=DEFAULT_PORT, once=True):
         """Test the modem."""
         try:
             self.ser = aioserial.AioSerial(port=port)
@@ -52,31 +52,35 @@ class PhoneModem:
             self.ser = None
             raise exceptions.SerialError from ex
 
-    async def initialize(self, port=DEFAULT_PORT):
-        """Initialize modem."""
-        self.port = port
-        await self.test(port)
-
-        _LOGGER.debug("Opening port %s", self.port)
-
         asyncio.create_task(self._modem_sm())
 
         try:
             await self._sendcmd("AT")
             if self._get_response() == "":
-                _LOGGER.error("No response from modem on port %s", self.port)
+                _LOGGER.error("No response from modem on port %s", port)
                 self.ser.close()
                 self.ser = None
-                return
+                raise exceptions.ResponseError
             await self._sendcmd(self.cmd_callerid)
             if self._get_response() in ["", "ERROR"]:
                 _LOGGER.error("Error enabling caller id on modem")
                 self.ser.close()
                 self.ser = None
-                return
+                raise exceptions.ResponseError
         except aioserial.SerialException:
-            _LOGGER.error("Unable to communicate with modem on port %s", self.port)
+            _LOGGER.error("Unable to communicate with modem on port %s", port)
             self.ser = None
+
+        if once is True:
+            await self.close()
+
+    async def initialize(self, port=DEFAULT_PORT):
+        """Initialize modem."""
+        self.port = port
+        await self.test(port, False)
+
+        _LOGGER.debug("Opening port %s", port)
+
         await self._set_state(self.STATE_IDLE)
 
     def registercallback(self, incomingcallback=None):
@@ -116,28 +120,8 @@ class PhoneModem:
 
     async def _set_state(self, state):
         """Set the state."""
-        self._state = state
+        self.state = state
         return
-
-    @property
-    def state(self):
-        """Return the state of the device."""
-        return self._state
-
-    @property
-    def get_cidname(self):
-        """Return last collected caller id name field."""
-        return self.cid_name
-
-    @property
-    def get_cidnumber(self):
-        """Return last collected caller id number."""
-        return self.cid_number
-
-    @property
-    def get_cidtime(self):
-        """Return time of last call."""
-        return self.cid_time
 
     def _get_response(self):
         """Return completion code from modem (OK, ERROR, null string)."""
@@ -154,7 +138,9 @@ class PhoneModem:
             self.ser = None
         return
 
-    async def _modem_sm(self, timeout=READ_IDLE_TIMEOUT):
+    async def _modem_sm(
+        self, timeout=READ_IDLE_TIMEOUT
+    ):  # pylint: disable=too-many-statements
         """Handle modem response state machine."""
         read_timeout = timeout
         while self.ser:
